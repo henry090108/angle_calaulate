@@ -1,0 +1,141 @@
+# --- 여기가 핵심: 대화형 백엔드 지정(항상 pyplot import 전에!) ---
+import matplotlib
+matplotlib.use("TkAgg")  # 안되면 "Qt5Agg"로 바꿔서 시도
+
+import os, math, sys
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+
+# 1) 이미지 경로만 바꾸세요
+IMAGE_PATH = r"C:\Users\traph\Downloads\test.jpg"
+
+def fail(msg): print("[오류]", msg); sys.exit(1)
+
+def load_image(path):
+    if not os.path.isfile(path): fail(f"이미지 없음: {path}")
+    img = cv2.imread(path); 
+    if img is None: fail(f"이미지 로드 실패: {path}")
+    return img
+
+def detect_baseline(gray_blur, H, W):
+    edges = cv2.Canny(gray_blur, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100,
+                            minLineLength=W//3, maxLineGap=20)
+    if lines is not None and len(lines)>0:
+        best, best_score = None, -1
+        for (x1,y1,x2,y2) in lines[:,0,:]:
+            length = ((x2-x1)**2+(y2-y1)**2)**0.5
+            ang = abs(math.degrees(math.atan2(y2-y1, x2-x1)))
+            horiz = 1/(1+ang)
+            bottomness = max(y1,y2)/H
+            score = length*horiz*(0.5+bottomness)
+            if score>best_score: best_score, best = score, (x1,y1,x2,y2)
+        x1,y1,x2,y2 = best
+        return (x1,y1,x2,y2), int(round((y1+y2)/2))
+    # 백업: 하단 30%의 수평 경계
+    top = int(H*0.7)
+    band = gray_blur[top:,:]
+    sob = cv2.Sobel(band, cv2.CV_64F, 0, 1, ksize=3)
+    row = np.mean(np.abs(sob), axis=1)
+    y_rel = int(np.argmax(row))
+    y = top + y_rel
+    return (0,y,W-1,y), y
+
+def make_mask(gray_blur, baseline_y):
+    _, t1 = cv2.threshold(gray_blur, 0,255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+    t2 = cv2.adaptiveThreshold(gray_blur,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY_INV,35,2)
+    mask = cv2.bitwise_or(cv2.bitwise_not(t1), t2)
+    roi = np.zeros_like(mask); roi[:baseline_y+5,:]=255
+    mask = cv2.bitwise_and(mask, roi)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, 2)
+    return mask
+
+def pick_contour(mask, baseline_y):
+    cs,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    best,score=-1,None
+    chosen=None
+    for c in cs:
+        area = cv2.contourArea(c)
+        if area<200: continue
+        ys = c[:,:,1]
+        dist = abs(baseline_y - int(np.max(ys)))
+        s = area + 50*max(0, 30-dist)
+        if s>best: best,chosen=s,c
+    return chosen
+
+def fit_circle(points):
+    x = points[:,0].astype(np.float64); y = points[:,1].astype(np.float64)
+    A = np.column_stack([2*x,2*y,np.ones_like(x)]); b = x*x + y*y
+    cx,cy,c0 = np.linalg.lstsq(A,b,rcond=None)[0]
+    r = math.sqrt(cx*cx + cy*cy + c0); return cx,cy,r
+
+def tangent_angle(contour_xy, cp, window=60):
+    d = np.linalg.norm(contour_xy - cp, axis=1)
+    pts = contour_xy[np.argsort(d)[:window]]
+    cx,cy,_ = fit_circle(pts)
+    vx,vy = cp[0]-cx, cp[1]-cy
+    tx,ty = -vy, vx
+    ang = (math.degrees(math.atan2(ty,tx)) + 360) % 180
+    return ang, (tx,ty)
+
+def main():
+    img = load_image(IMAGE_PATH)
+    H,W = img.shape[:2]; orig = img.copy()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray,(5,5),0)
+
+    (bx1,by1,bx2,by2), base_y = detect_baseline(blur, H, W)
+    base_ang = (math.degrees(math.atan2(by2-by1, bx2-bx1)) + 360) % 180
+
+    mask = make_mask(blur, base_y)
+    cnt = pick_contour(mask, base_y)
+    if cnt is None: fail("액적 윤곽을 찾지 못함")
+
+    xy = cnt.reshape(-1,2)
+    near = xy[np.abs(xy[:,1]-base_y)<=6]
+    if len(near)<2: near = xy[np.abs(xy[:,1]-base_y)<=12]
+    if len(near)<2: fail("접촉점 후보 부족")
+    left = near[np.argmin(near[:,0])]; right = near[np.argmax(near[:,0])]
+
+    la, lt = tangent_angle(xy, left, 60)
+    ra, rt = tangent_angle(xy, right,60)
+    thetaL = (la - base_ang) % 180
+    thetaR = (ra - base_ang) % 180
+    thetaA = (thetaL + thetaR)/2
+
+    # 주석 이미지 생성 후 matplotlib로 화면 표시
+    ann = orig.copy()
+    cv2.line(ann,(bx1,by1),(bx2,by2),(0,255,255),2)
+    cv2.drawContours(ann,[cnt],-1,(0,0,255),2)
+    cv2.circle(ann,tuple(map(int,left)),6,(0,255,0),-1)
+    cv2.circle(ann,tuple(map(int,right)),6,(0,255,0),-1)
+    def draw_tangent(img, cp, tv, color):
+        L=120; vx,vy=tv; n=(vx*vx+vy*vy)**0.5+1e-6; vx,vy=vx/n,vy/n
+        p1=(int(cp[0]-vx*L),int(cp[1]-vy*L))
+        p2=(int(cp[0]+vx*L),int(cp[1]+vy*L))
+        cv2.line(img,p1,p2,color,2)
+    draw_tangent(ann,left,lt,(255,0,0)); draw_tangent(ann,right,rt,(255,0,0))
+    cv2.putText(ann,f"L:{thetaL:.2f}°",(int(left[0])+10,int(left[1])-20),
+                cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,255,255),2)
+    cv2.putText(ann,f"R:{thetaR:.2f}°",(int(right[0])-170,int(right[1])-20),
+                cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,255,255),2)
+    cv2.putText(ann,f"Avg:{thetaA:.2f}°",(20,40),
+                cv2.FONT_HERSHEY_SIMPLEX,1.0,(0,255,255),2)
+
+    print(f"[기준선 각도] {base_ang:.2f}°")
+    print(f"[왼쪽 접촉각] {thetaL:.2f}°")
+    print(f"[오른쪽 접촉각] {thetaR:.2f}°")
+    print(f"[평균 접촉각] {thetaA:.2f}°")
+
+    rgb = cv2.cvtColor(ann, cv2.COLOR_BGR2RGB)
+    plt.figure(figsize=(6,8))
+    plt.imshow(rgb); plt.axis("off")
+    plt.title(f"L={thetaL:.2f}°, R={thetaR:.2f}°, Avg={thetaA:.2f}°")
+    plt.show()
+
+if __name__ == "__main__":
+    main()
