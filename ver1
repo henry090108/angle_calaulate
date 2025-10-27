@@ -8,7 +8,7 @@ import cv2
 import matplotlib.pyplot as plt
 
 # 1) 이미지 경로만 바꾸세요
-IMAGE_PATH = r"C:\Users\traph\Downloads\test.jpg"
+IMAGE_PATH = r"C:\Users\..."
 
 def fail(msg): print("[오류]", msg); sys.exit(1)
 
